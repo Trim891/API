@@ -9,14 +9,17 @@ import concurrent.futures as conc
 from pyzbar.pyzbar import decode
 import tempfile
 import os
+import sys
+from sys import platform
+
+from PIL import Image
 
 scale_percent = 50  # percent of original size
 delta = 0
 
-
 def GetText_potok(image, executor,graph,futures, lang, result = None):
     # Макс количество вершин для одного расчета
-    max_kol = 10
+    max_kol = 40
     spis = []
     for uzel in range(0, len(graph)):
         spis.append(uzel)
@@ -247,50 +250,122 @@ def CreateBlocks(cur,for_all_list = 0):
         INSERT INTO rec SELECT * FROM NewRec;
 
         DROP TABLE NewRec;""")
-
-    if for_all_list == 0:
-        # Теперь надо исключить самые маленькие поля, которые по статистике не влазят. Это мусор, который случайно прилип
-        cur.execute("""update rec set index_block = 0
-                where
-                (index_block>0
-                and index_block in
-                (select rec.index_block from rec
-                where index_block>0
-                GROUP BY index_block
-                    HAVING count(index_m) < 4
-                )) or (index_block>0 and index_p<0)""")
-
-        del_id_block = []
-
-        cur.execute("""select index_block, index_m, h from  rec 
-                   where index_block>0 
-                    order by index_block, h""")
-        all_block = cur.fetchall()
-        # беру 2 самых маленьких элемента категории блок. Одна категория - значит что разница самого маленького и самого крупного должна быть не более 40% от характеристики самого маленького элемента.
-        # если видно явное отличие одной категории от другой и мощность первого сильно меньше мощности второго, то удаляю всю первую категорию из связанных ячеек
-
-        trash_t = DetectTrash(all_block)
-        cur.execute("""select index_block, index_m, w from  rec 
-                           where index_block>0 
-                            order by index_block, w""")
-        all_block = cur.fetchall()
-        trash_w = DetectTrash(all_block)
-        #Если узлы в категориях пересекаются, то удалить
-        for trash in trash_t:
-             if trash_w.get(trash) != None:
-                 for uzel in trash_w[trash]:
-                     if uzel in trash_t[trash]:
-                         del_id_block.append([uzel])
-        for trash in trash_w:
-             if trash_t.get(trash) != None:
-                 for uzel in trash_t[trash]:
-                     if uzel in trash_w[trash]:
-                         del_id_block.append([uzel])
-        cur.execute("""create table trash (index_block INT) """)
-        cur.executemany("INSERT INTO trash VALUES(?);", del_id_block)
-        cur.execute("""update rec set index_block = 0 where index_m in (select * from trash)""")
-        cur.execute("""DROP table trash """)
     cur.execute("""DROP TABLE par """)
+    if for_all_list == 0:
+        DeleteTrash(cur)
+
+def DeleteTrash(cur):
+    # Теперь надо исключить самые маленькие поля, которые по статистике не влазят. Это мусор, который случайно прилип
+    # а также где меньше 4 элементов
+    cur.execute("""update rec set index_block = 0
+            where
+            (index_block>0
+            and index_block in
+            (select rec.index_block from rec
+            where index_block>0
+            GROUP BY index_block
+                HAVING count(index_m) < 4
+            )) or (index_block>0 and index_p<0)""")
+
+    del_id_block = []
+
+    # кластеризую по высоте и ширине. вычисляю мощность множеств относительно всего блока
+    # если мощность меньше определенного процента, и какой то узел и в кластере по ширине и в кластере по высоте
+    # то это мусор - выкидываем
+
+    cur.execute("""select distinct index_block from rec 
+                      where index_block>0 
+                       order by index_block""")
+    all_block = cur.fetchall()
+    cur.executescript("""
+                        CREATE TABLE h_rec(
+                           index_block INT ,
+                           h int);""")
+
+    cur.executescript("""CREATE TABLE w_rec(
+                            index_block INT ,
+                            w int);""")
+
+    for ind_block in all_block:
+        cat_lt = PihtoKategor(cur, 'h', 'h', ind_block[0])
+        cur.executemany("INSERT INTO h_rec VALUES(?,?);", cat_lt)
+        cat_lt = PihtoKategor(cur, 'w', 'w', ind_block[0])
+        cur.executemany("INSERT INTO w_rec VALUES(?,?);", cat_lt)
+
+    # на основе этих категорий набираю элементы и вычисляю относительную мощность
+    cur.execute("""select 
+                    vl.index_block,
+                    GROUP_CONCAT(vl.index_m) from
+                    (select
+                    rec.index_block,
+                    GROUP_CONCAT(rec.index_m) as index_m,
+                    h_rec.h                       
+                  from  delta,
+                    rec inner join h_rec on h_rec.index_block = rec.index_block and abs(h_rec.h - rec.h) <= delta.value
+                    inner join (select index_block, count(index_m) as kol from rec group by index_block) as all_bl on all_bl.index_block = rec.index_block
+                group by rec.index_block,h_rec.h
+                having  round(cast(COUNT(rec.index_m) as float)/max(all_bl.kol)*100,2)<=5) as vl group by index_block""")
+
+    all_block_h = cur.fetchall()
+    cur.execute("""select 
+                    vl.index_block,
+                    GROUP_CONCAT(vl.index_m) from
+                    (select
+                    rec.index_block,
+                    GROUP_CONCAT(rec.index_m) as index_m,
+                    w_rec.w                                
+                  from  delta,
+                    rec inner join w_rec on w_rec.index_block = rec.index_block and abs(w_rec.w - rec.w) <= delta.value
+                    inner join (select index_block, count(index_m) as kol from rec group by index_block) as all_bl on all_bl.index_block = rec.index_block
+                    group by rec.index_block,w_rec.w
+                    having  round(cast(COUNT(rec.index_m) as float)/max(all_bl.kol)*100,2)<=5) as vl group by index_block""")
+
+    all_block_w = cur.fetchall()
+    # теперь нужно проверить есть для массивов блоков пересекающиеся значения
+    # пусть цикл в цикле цикла будет, лень запросами что то создавать или превращать в справочники. так проще
+    for l_w in all_block_w:
+        for l_h in all_block_h:
+            if l_w[0] == l_h[0]:
+                list_w = list(filter(None, l_w[1].split(',')))
+                list_h = list(filter(None, l_h[1].split(',')))
+                udal = [int(item) for item in list(set(list_w) & set(list_h))]
+                for uzel in udal:
+                    del_id_block.append([uzel])
+    cur.executescript("drop table h_rec ; drop table w_rec")
+    cur.execute("""create table trash (index_block INT) """)
+    cur.executemany("INSERT INTO trash VALUES(?);", del_id_block)
+    cur.execute("""update rec set index_block = 0 where index_m in (select * from trash)""")
+    cur.execute("""delete from trash""")
+
+    # беру 2 самых маленьких элемента категории блок. Одна категория - значит что разница самого маленького и самого крупного должна быть не более 40% от характеристики самого маленького элемента.
+    # если видно явное отличие одной категории от другой и мощность первого сильно меньше мощности второго, то удаляю всю первую категорию из связанных ячеек
+
+    del_id_block = []
+    cur.execute("""select index_block, index_m, h from  rec 
+               where index_block>0 
+                order by index_block, h""")
+    all_block = cur.fetchall()
+    trash_t = DetectTrash(all_block)
+    cur.execute("""select index_block, index_m, w from  rec 
+                       where index_block>0 
+                        order by index_block, w""")
+    all_block = cur.fetchall()
+    trash_w = DetectTrash(all_block)
+    #Если узлы в категориях пересекаются, то удалить
+    for trash in trash_t:
+         if trash_w.get(trash) != None:
+             for uzel in trash_w[trash]:
+                 if uzel in trash_t[trash]:
+                     del_id_block.append([uzel])
+    for trash in trash_w:
+         if trash_t.get(trash) != None:
+             for uzel in trash_t[trash]:
+                 if uzel in trash_w[trash]:
+                     del_id_block.append([uzel])
+    cur.executemany("INSERT INTO trash VALUES(?);", del_id_block)
+    cur.execute("""update rec set index_block = 0 where index_m in (select * from trash)""")
+    cur.execute("""DROP table trash """)
+
 
 def DetectTrash(all_block):
     tec_bl = None
@@ -816,77 +891,17 @@ def InsertTable(cur, len_coordinates, img):
     # Для начала вычисляется уровень вложенности
     FillRealParent(cur)
 
-    # задается предел отклонения
-    cur.executescript("""
-        CREATE TABLE delta( 
-             value 
-          );
-
-        insert into delta select %s; 
-        """ % (str(delta)))
-
     #вычисляю блоки ячеек, которые связаны между собой
     CreateBlocks(cur)
 
-    # cur.execute("""select * from rec where index_block>0 and index_p>0 """)
-    # all_results = cur.fetchall()
-    # Output1 = img.copy()
-    # for qwe in all_results:
-    #     block, ind, p, l, t, w, h, txt = qwe
-    #     cv2.rectangle(Output1, (l, t), (l + w, t + h), (125, 125, 255), 2)
-    #     cv2.putText(Output1, str(ind), (l, round((t + t + h) / 2) + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    #
-    # width = int(Output1.shape[1] * 30 / 100)
-    # height = int(Output1.shape[0] * 30 / 100)
-    # dim = (width, height)
-    # resized = cv2.resize(Output1, dim, interpolation=cv2.INTER_AREA)
-    # cv2.imshow("Output1", resized)
-    # cv2.waitKey(0)
-
-
     #нужно самые крайние блоки дотянуть до границы родителя, если эти блоки находятся недалеко от границы родителя
     rast_block(cur)
+
     #по возможности достраиваю таблицу до полного прямоугльника
     FillToFullRec(cur,len_coordinates)
     #удаляю те блоки, которые не получилось дотянуть до полного прямоугольника
     #у таких сумма всех длин граничных блока не +- равна границе
-    # cur.execute("""select * from rec
-    #                    where  index_p>0 and index_block>0
-    #                     order by index_m""")
-    # all_results = cur.fetchall()
-    # cur.execute("""
-    #         select *
-    #             from (
-    #                 select
-    #                     vl.index_block,
-    #                     max(CAST(vl.th-vl.t as float)) as r_t,
-    #                     max(CAST(vl.lw - vl.l as float)) as r_l,
-    #                     sum(CAST(case when abs(rec.t - vl.t)<= delta.value then  rec.w else 0 end as float)) as sum_lt,
-    #                     sum(CAST(case when abs(rec.t + rec.h - vl.th)<= delta.value then  rec.w else 0 end as float)) as sum_lb,
-    #                     sum(CAST(case when abs(rec.l - vl.l)<= delta.value then  rec.h else 0 end as float)) as sum_tl,
-    #                     sum(CAST(case when abs(rec.l+rec.w - vl.lw)<= delta.value then  rec.h else 0 end as float)) as sum_tr
-    #                 from
-    #                     delta,
-    #                     (select index_block, min(l) as l, min(t) as t, max(l+w) as lw, max(t+h) as th from  rec
-    #                     where index_block>0
-    #                     group by index_block) as vl left join rec on
-    #                     vl.index_block =  rec.index_block
-    #                     group by vl.index_block) as vl
-    #                 Where
-    #                     vl.sum_lt/vl.r_l < 0.90
-    #                     or vl.sum_lb/vl.r_l < 0.90
-    #                     or vl.sum_tl/vl.r_t < 0.90
-    #                     or vl.sum_tr/vl.r_t < 0.90
-    #                     or vl.sum_lt/vl.r_l > 1.1
-    #                     or vl.sum_lb/vl.r_l > 1.1
-    #                     or vl.sum_tl/vl.r_t > 1.1
-    #                     or vl.sum_tr/vl.r_t > 1.1
-    #
-    #             """)
-    # all_results1 = cur.fetchall()
-    # cur.execute("""select * from rec
-    #                       where  index_ddd>0 and index_block>0
-    #                        order by index_m""")
+
     cur.execute("""
         update rec set index_block = 0 where index_block in (
             select vl.index_block 
@@ -917,8 +932,10 @@ def InsertTable(cur, len_coordinates, img):
                     or vl.sum_tr/vl.r_t > 1.05
             )
             """)
+
     #так как появились новые, то заново нужно сделать
     FillRealParent(cur)
+
     #уберем индекс блока, если блок находится внутри прямоугольника, у котрого родитель имеет родителя
     cur.execute("""update rec set index_block = 0 where not index_m in 
         (Select 
@@ -928,36 +945,6 @@ def InsertTable(cur, len_coordinates, img):
         where rec.index_block <> 0 and rec_.index_p = -1         
         )""")
 
-    #тест на показ новый прямоугольников
-    #all_results = cur.fetchall()
-
-    # cur.execute("""select * from  rec
-    #         where index_block>0 and index_p>0
-    #          order by index_block, h""")
-    # all_results = cur.fetchall()
-    #
-    # all_ = 0
-    # output = img.copy()
-    # for qwe in all_results:
-    #     block, ind, p, l, t, w, h = qwe
-    #
-    #     all_ = block + 5
-    #
-    #     all_ = all_ + 1
-    #     col_r = 50 * all_ % 255
-    #     col_g = 30 * (all_ + 2) % 255
-    #     col_b = 40 * (all_ + 4) % 255
-    #     cv2.rectangle(output, (l, t), (l + w, t + h), (col_r, col_g, col_b), 2)
-    #     cv2.putText(output, str(ind), (l, round((t + t + h) / 2) + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    #
-    #     # break
-    #
-    # width = int(output.shape[1] * scale_percent / 100)
-    # height = int(output.shape[0] * scale_percent / 100)
-    # dim = (width, height)
-    # resized = cv2.resize(output, dim, interpolation=cv2.INTER_AREA)
-    #
-    # cv2.imshow("Output1" + str(all_), resized)
 
 def sum_col_raw_span(graph,tek,napr, dop = []):
     sum = 0
@@ -1074,13 +1061,13 @@ def opr_shap(graph):
         i = i + 1
         if i>20:
             return []
-        result = rec_opr_shap(0, shap,spis_uzl, len_shap, graph, 0);
+        result = rec_opr_shap(0, shap,spis_uzl, len_shap, graph, 0)
         if result == None:
-            find = 1;
+            find = 1
         elif type(result) == int:
             shap = []
             spis_uzl = []
-            len_shap = result;
+            len_shap = result
         else:
             return []
 
@@ -1090,61 +1077,78 @@ def opr_shap(graph):
     return shap
 
 def gettext(image, graph, vertices, lang, result):
+    try:
+        for uzel in vertices:
+        
+            # 6 лучше разбирает текст в несколько строк, стандарт 3 - длинные строки, 7 - цифры
+            # теперь нужно сравнить и выбрать лучший текст
 
-    for uzel in vertices:
-        # 6 лучше разбирает текст в несколько строк, стандарт 3 - длинные строки, 7 - цифры
-        # теперь нужно сравнить и выбрать лучший текст
-        t1 = graph[uzel]['t']
-        t2 = graph[uzel]['th']
-        l1 = graph[uzel]['l']
-        l2 = graph[uzel]['lw']
+            t1 = graph[uzel]['t']
+            t2 = graph[uzel]['th']
+            l1 = graph[uzel]['l']
+            l2 = graph[uzel]['lw']
 
-        text1 = pytesseract.image_to_string(image[t1:t2, l1:l2], lang=lang, config='--psm 6')
-        text2 = pytesseract.image_to_string(image[t1:t2, l1:l2], lang=lang, config='')
-        text3 = pytesseract.image_to_string(image[t1 + round(delta / 2):t2 - round(delta / 2), l1 + round(delta / 2):l2 - round(delta / 2)], lang=lang, config='--psm 7')
+            # Если result = none тогда это распознавание большого куска текста, а значит нет смысла в сравнивании
+            if result == None:
+                text1 = pytesseract.image_to_string(image[t1:t2, l1:l2], lang=lang, config='--psm 6')
+                text1 = text1.replace("\n", " ")
+                text1 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text1)
+                while text1.find('  ') != -1:
+                    text1 = text1.replace('  ', ' ')
+                text1 = text1.strip()
+                graph[uzel]['text'] = text1
+                continue
+        
+            text1 = pytesseract.image_to_string(image[t1:t2, l1:l2], lang=lang, config='--psm 6')
+            text2 = pytesseract.image_to_string(image[t1:t2, l1:l2], lang=lang, config='')
+            text3 = pytesseract.image_to_string(image[t1 + round(delta / 2):t2 - round(delta / 2), l1 + round(delta / 2):l2 - round(delta / 2)], lang=lang, config='--psm 7')
 
-        text1 = text1.replace("\n", " ")
-        text2 = text2.replace("\n", " ")
-        text3 = text3.replace("\n", " ")
+            text1 = text1.replace("\n", " ")
+            text2 = text2.replace("\n", " ")
+            text3 = text3.replace("\n", " ")
 
-        text1 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text1)
-        text2 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text2)
-        text3 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text3)
+            text1 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text1)
+            text2 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text2)
+            text3 = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:; ]+ *', ' ', text3)
 
-        while text1.find('  ')!=-1:
-            text1 = text1.replace('  ',' ')
-        while text2.find('  ') != -1:
-            text2 = text2.replace('  ', ' ')
-        while text3.find('  ') != -1:
-            text3 = text3.replace('  ', ' ')
-
-        text1 = text1.strip()
-        text2 = text2.strip()
-        text3 = text3.strip()
-        #Если 2 из 3х равны и не пусто, то это нужный текст
-        #если text3 - только цифры и знаки препинания, а в остальных что угодно, то это text3, но нужно учитывать размеры текстов
-        #бывает, когда текст3 просто не распознаёт текст, а в реальности достаточно много символов
-        #если text3 - буквы, а остальное, хотя бы одно, не пустое и содержит более 2х символов, то беру макс слово
-        if text1 == text2 and text2==text3:
-            text = text1
-        elif (text1 == text2 or text1 == text3) and len(text1) > 2:
-            text = text1
-        elif text2 == text3 and len(text2) > 2:
-            text = text2
-        elif text3!='' and re.sub(' *[^ \-\d\.,]+ *', '', text3) == text3 and (len(text1) + len(text2))/2*0.4<len(text3) :
-            text = text3
-        elif text3!='' and len(text1) <= 2 and len(text2) <= 2:
-            text = ''
-        elif len(text1)>=len(text2) and len(text1)>2:
-            text = text1
-        elif len(text2) >= len(text1) and len(text2)> 2:
-            text = text2
-        else:
-            text = ''
-        graph[uzel]['text'] = text
-        if text != '':
-            if result != None:
-                result[uzel] = 1
+            while text1.find('  ')!=-1:
+                text1 = text1.replace('  ',' ')
+            while text2.find('  ') != -1:
+                text2 = text2.replace('  ', ' ')
+            while text3.find('  ') != -1:
+                text3 = text3.replace('  ', ' ')
+            
+            text1 = text1.strip()
+            text2 = text2.strip()
+            text3 = text3.strip()
+            
+            #Если 2 из 3х равны и не пусто, то это нужный текст
+            #если text3 - только цифры и знаки препинания, а в остальных что угодно, то это text3, но нужно учитывать размеры текстов
+            #бывает, когда текст3 просто не распознаёт текст, а в реальности достаточно много символов
+            #если text3 - буквы, а остальное, хотя бы одно, не пустое и содержит более 2х символов, то беру макс слово
+            if text1 == text2 and text2==text3:
+                text = text1
+            elif (text1 == text2 or text1 == text3) and len(text1) > 2:
+                text = text1
+            elif text2 == text3 and len(text2) > 2:
+                text = text2
+            elif text3!='' and re.sub(' *[^ \-\d\.,]+ *', '', text3) == text3 and (len(text1) + len(text2))/2*0.4<len(text3) :
+                text = text3
+            elif text3!='' and len(text1) <= 2 and len(text2) <= 2:
+                text = ''
+            elif len(text1)>=len(text2) and len(text1)>2:
+                text = text1
+            elif len(text2) >= len(text1) and len(text2)> 2:
+                text = text2
+            else:
+                text = ''
+            graph[uzel]['text'] = text
+            if text != '':
+                if result != None:
+                    result[uzel] = 1
+    except:
+        print(sys.exc_info()[1])
+        
 
 def get_table_structure(graph):
     # по получить граф тех элементов, которые распознались как шапка. Если шапки нет, то граф всей таблицы.
@@ -1168,17 +1172,12 @@ def get_table_structure(graph):
 
     return  structure
 
-def TableGraph(cur,image):
+def TableGraph(cur,image, image_pil):
     #Сначала получаю все средние горизонтали таблиц
     cur.execute("""select distinct index_block from rec
                where index_block>0 and index_p>0
                 order by t""")
     all_results = cur.fetchall()
-
-    cur.execute("""select distinct * from rec
-               where index_block>0 and index_p>0
-                order by t""")
-    all_results1 = cur.fetchall()
 
     cur.executescript("""
         CREATE TABLE t_rec(
@@ -1484,16 +1483,14 @@ def TableGraph(cur,image):
         graph = correct_col_raw_span(thsi_gr)
         if len(graph)>0:
             shap = opr_shap(graph)
-            #list_gr.append({'index_block':-1*tek_bl,'graph':graph,'shap':shap})
             list_gr[str(-1 * tek_bl)] = {'graph': graph, 'shap': shap, 'structure': get_table_structure(graph)}
 
 
     #всё, что не попало в графы - не таблицы, уберу индекс блока
     # нужно разбить на несколько потоков, что бы распознование было быстрее
-    executor = conc.ThreadPoolExecutor(20)
+    executor = conc.ThreadPoolExecutor(5)
     futures = []
     result = {}
-
     for graphs in list_gr:
         result[graphs] = [0 for i in range(0, len(list_gr[graphs]['graph']))]
         GetText_potok(image, executor, list_gr[graphs]['graph'], futures,'rus+eng',result[graphs])
@@ -1504,10 +1501,6 @@ def TableGraph(cur,image):
             list_gr.pop(graphs)
     #проставлю данные шапок
     for graphs in list_gr:
-        # MaxVer = -1
-        # for shap in list_gr[graphs]['shap']:
-        #     MaxVer = max(MaxVer, shap['vertices'])
-        # VerInShap = [i for i in range(0, MaxVer + 1)]
         for shap in list_gr[graphs]['shap']:
             shap['sinonim'] = list_gr[graphs]['graph'][shap['vertices']]['text']
             shap['name'] = re.sub( "[^А-Яа-я\d\w]+", '',shap['sinonim'])
@@ -1516,12 +1509,6 @@ def TableGraph(cur,image):
             shap['sinonim'] = re.sub(' *[^ \(\)А-Яа-я\d\w\/\\\.\-,:;]+ *', '', shap['sinonim'])
             while shap['sinonim'].find('  ') != -1:
                 shap['sinonim'] = shap['sinonim'].replace('  ', ' ')
-            # shap['kol'] = 1
-            # VerInShap[shap['vertices']] = 0
-
-        # for shap in VerInShap:
-        #     if shap != 0:
-        #         list_gr[graphs]['shap'].append({'vertices':shap,'sinonim':'','name':'','kol':0})
 
     return list_gr
 
@@ -1585,24 +1572,13 @@ def RecognizeTextField(cur,image):
         dict['lw'] = l + w
         dict['text'] = ''
         graph.append(dict)
-
-    # Output1 = image.copy()
-    # for qwe in graph:
-    #     ind,  t, h, l,w, txt = qwe
-    #     cv2.rectangle(Output1, (qwe[l]+50, qwe[t]+50), ( qwe[w]-50, qwe[h]-50), (125, 125, 255), 2)
-    #
-    # width = int(Output1.shape[1] * 30 / 100)
-    # height = int(Output1.shape[0] * 30 / 100)
-    # dim = (width, height)
-    # resized = cv2.resize(Output1, dim, interpolation=cv2.INTER_AREA)
-    # cv2.imshow("Output1", resized)
-    # cv2.waitKey(0)
-
+   
+        
     executor = conc.ThreadPoolExecutor(5)
     futures = []
     GetText_potok(image, executor, graph, futures, 'rus')
     conc.wait(futures)
-
+    
     # заливаю в основную таблицу
     new_rec = []
     for dict in graph:
@@ -1695,21 +1671,17 @@ def RecognizeTextField(cur,image):
 
 def recognzie(pathImg, tesseract_cmd, in_json = False):
     global delta
-    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    if not (platform == "linux" or platform == "linux2"):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     img = cv2.imread(pathImg)
+
     #убираю штрихкода
+    
     code = decode(img)
     for barcode in code:
         img[barcode.rect.top:barcode.rect.top+barcode.rect.height,barcode.rect.left:barcode.rect.left+barcode.rect.width] = np.array([255,255,255])
-
-    # gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # ret, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # kernel = np.ones((2, 2), np.uint8)
-    # dilated_value = cv2.dilate(thresh, kernel, iterations=1)
-    # # #thresh_value = 255 - cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    # dilated_value = cv2.GaussianBlur(dilated_value, (3,3), 0)
-
-    clahe = cv2.createCLAHE(clipLimit=50, tileGridSize=(50, 50))
+    
+    clahe = cv2.createCLAHE(clipLimit=100, tileGridSize=(100, 100))
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)  # convert from BGR to LAB color space
     l, a, b = cv2.split(lab)  # split on 3 different channels
     l2 = clahe.apply(l)  # apply CLAHE to the L-channel
@@ -1717,20 +1689,19 @@ def recognzie(pathImg, tesseract_cmd, in_json = False):
     img2 = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)  # convert from LAB to BGR
 
     gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-    ret, thresh = cv2.threshold(gray, 75, 255, cv2.THRESH_BINARY_INV)
+    ret, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
 
     kernel = np.ones((2, 2), np.uint8)
-    obr_img = cv2.erode(thresh, kernel, iterations=1)
+    obr_img = cv2.dilate(thresh, kernel, iterations=1)
 
-    obr_img = cv2.GaussianBlur(obr_img, (3, 3), 0)
+    obr_img = cv2.GaussianBlur(thresh, (1, 1), 0)
+    ish_image = Image.open(pathImg)
 
     fhandle, fname = tempfile.mkstemp(suffix='.db', dir=tempfile.gettempdir())
     try:
         con = sl.connect(fname, uri=True, isolation_level=None, check_same_thread=False)
-        #con = sl.connect('file::memory:?cache=shared', uri=True, isolation_level=None, check_same_thread=False)
         cur = con.cursor()
-
-        contours, hierarchy = cv2.findContours(obr_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_L1)
+        contours, hierarchy = cv2.findContours(obr_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_L1)[-2:]
         coordinates = []
         ogr = round(max(img.shape[0], img.shape[1]) * 0.005)
         delta = round(ogr/2 +0.5)
@@ -1769,27 +1740,36 @@ def recognzie(pathImg, tesseract_cmd, in_json = False):
                text str)""")
         cur.executemany("INSERT INTO rec VALUES(?,?, ?, ?, ?, ?, ?,?);", coordinates)
 
+        # задается предел отклонения
+        cur.executescript("""
+                CREATE TABLE delta( 
+                     value 
+                  );
+
+                insert into delta select %s; 
+                """ % (str(delta)))
+
+        # иногда, выделяются 2 контура на 1 ячейке. Нужно обнулить такое
+        cur.execute("""delete from rec where index_m in (
+                            select
+                                    rec.index_m
+                                from
+                                    delta,
+                                    rec as rec
+                                    inner join rec as rec_ on
+                                        rec.index_m < rec_.index_m
+                                        and abs(rec.t - rec_.t)<= delta.value and abs(rec.l - rec_.l)<= delta.value and abs(rec.h - rec_.h)<= delta.value
+                                        and abs(rec.w - rec_.w)<= delta.value)
+
+                            """)
 
         InsertTable(cur,len(coordinates) + 1,img)
 
-        # cur.execute("""select * from rec
-        #                    where  index_p = 1""")
-        # all_results = cur.fetchall()
-        # Output1 = img.copy()
-        # for qwe in all_results:
-        #     block, ind, p, l, t, w, h, txt = qwe
-        #     cv2.rectangle(Output1, (l, t), (l + w, t + h), (125, 125, 255), 2)
-        #     cv2.putText(Output1, str(ind), (l, round((t + t + h) / 2) + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        #
-        # width = int(Output1.shape[1] * 30 / 100)
-        # height = int(Output1.shape[0] * 30 / 100)
-        # dim = (width, height)
-        # resized = cv2.resize(Output1, dim, interpolation=cv2.INTER_AREA)
-        # cv2.imshow("Output1", resized)
-        # cv2.waitKey(0)
+        cur.execute("""select * from rec where index_block>0""")
 
         # Получил связанные таблицы, теперь надо превратить их в граф и распознать текст.
-        list_gr = TableGraph(cur, img)
+        list_gr = TableGraph(cur, img, ish_image)
+
         # Остаток страницы - это текст. Нужно вычленить связные кукски текста между таблицами. Один такой кусок - это одно вершина графа.
         # Таким образом, граф состоящий из кусков текста и шапок таблицы показывают что это за документ.
         # использую ту же самую технику, как и лдя таблиц, только теперь таблицы - это ячейки, родитель - весь лист, и не нужно достраивать
@@ -1817,62 +1797,21 @@ def recognzie(pathImg, tesseract_cmd, in_json = False):
             if list_gr.get(str(ib)) != None:
                 structure[i][1] = list_gr[str(ib)]['structure']
 
-            # if i + 1 < len(spis):
-            #     structure[i][1].append(i + 1)
-            #     structure[i + 1][1].append(i)
-
-        # цикл если делать граф по пересечениям, оставлю пока
-        # tek = 0
-        # rasm = 1
-        # while True:
-        #     if rasm > len(spis)-1:
-        #        break
-        #     else:
-        #         ib_tek, im_tek, ip_tek,l_tek,t_tek,w_tek,h_tek,text_tek = spis[tek]
-        #         ib_rasm, im_rasm, ip_rasm, l_rasm, t_rasm, w_rasm, h_rasm, text_rasm = spis[rasm]
-        #         if ((l_tek<= l_rasm <= l_tek + w_tek or l_tek<= l_rasm + w_rasm <= l_tek + w_tek or l_rasm<= l_tek<= l_tek + w_tek <= l_rasm + w_rasm) and
-        #             (t_tek <= t_rasm <= t_tek + h_tek or t_tek <= t_rasm + h_rasm <= t_tek + h_tek or t_rasm <= t_tek <= t_tek + h_tek <= t_rasm + h_rasm)):
-        #             # пересекаются
-        #             structure[im_tek][1].append(im_rasm)
-        #             structure[im_rasm][1].append(im_tek)
-        #
-        #             if list_gr.get(str(ib_rasm)) != None:
-        #                 structure[im_rasm][2] = list_gr[str(ib_rasm)]['structure']
-        #
-        #             rasm = rasm + 1
-        #         else:
-        #             structure[im_rasm-1][1].append(im_rasm)
-        #             structure[im_rasm][1].append(im_rasm-1)
-        #             if list_gr.get(str(ib_rasm)) != None:
-        #                 structure[im_rasm][2] = list_gr[str(ib_rasm)]['structure']
-        #             tek = rasm
-        #             rasm = rasm + 1
-
         cur.execute("""DROP TABLE rec""")
         con.close()
         result = {'data': data, 'structure': structure}
         os.close(fhandle)
         os.remove(fname)
+        
         if in_json == True:
             return json.dumps(result, ensure_ascii=False)
         else:
             return result
     except:
         os.remove(fname)
+        return str(sys.exc_info()[1])
 
 
-
-if __name__ == "__main__":
-    path = r'D:\qqqq_00012749.jpg'
-    # path = r'D:\13_ 14.01.2019.jpg'
-    # path = r'D:\SAMSUNG28032019_0002.jpg'
-    # path = r'D:\DEEPCOM28022019.jpg'
-    #
-    # cv2.imshow("Output1", dilated_value)
-    # cv2.waitKey(0)
-    input()
-    # print("Привет, {}!".format(namespace.file))
-    res = recognzie(path,r'C:\Program Files\Tesseract-OCR\tesseract.exe')
 
 
 
