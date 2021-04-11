@@ -19,7 +19,7 @@ delta = 0
 
 def GetText_potok(image, executor,graph,futures, lang, result = None):
     # Макс количество вершин для одного расчета
-    max_kol = 40
+    max_kol = 20
     spis = []
     for uzel in range(0, len(graph)):
         spis.append(uzel)
@@ -1691,10 +1691,13 @@ def recognzie(pathImg, tesseract_cmd, in_json = False):
     gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     ret, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
 
-    kernel = np.ones((2, 2), np.uint8)
-    obr_img = cv2.dilate(thresh, kernel, iterations=1)
+    #kernel = np.ones((2, 2), np.uint8)
+    #obr_img = cv2.dilate(thresh, kernel, iterations=1)
+    #obr_img = cv2.GaussianBlur(thresh, (1, 1), 0)
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+    obr_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-    obr_img = cv2.GaussianBlur(thresh, (1, 1), 0)
     ish_image = Image.open(pathImg)
 
     fhandle, fname = tempfile.mkstemp(suffix='.db', dir=tempfile.gettempdir())
